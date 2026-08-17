@@ -462,21 +462,43 @@ var S={
 };
 var root=document.getElementById("tt");
 
+// Hash shape: #/t/<code>[?dq_<questionId>=<value>&...]
+// The query part lets a link pre-answer "filled by moderator" style questions
+// (e.g. real user vs proxy) so remote participants never see them — the answer
+// travels with the link, not with a person standing next to them.
 function readHash(){
   try{
     var h=(location.hash||"").replace(/^#/,"");
-    var m=h.match(/^\/t\/([A-Za-z0-9]+)$/);
-    return m?m[1].toUpperCase():null;
+    var qi=h.indexOf("?");
+    var path=qi>=0?h.slice(0,qi):h;
+    var qs=qi>=0?h.slice(qi+1):"";
+    var m=path.match(/^\/t\/([A-Za-z0-9]+)$/);
+    if(!m) return null;
+    var tags={};
+    qs.split("&").forEach(function(pair){
+      if(!pair) return;
+      var eq=pair.indexOf("=");
+      if(eq<0) return;
+      var k=decodeURIComponent(pair.slice(0,eq)), v=decodeURIComponent(pair.slice(eq+1));
+      if(k.indexOf("dq_")===0) tags[k.slice(3)]=v;
+    });
+    return { code:m[1].toUpperCase(), tags:tags };
   }catch(e){ return null; }
 }
 function baseUrl(){
   try{ return location.href.split("#")[0]; }catch(e){ return ""; }
 }
-function shareUrl(code){ return baseUrl()+"#/t/"+code; }
+function shareUrl(code,tags){
+  var u=baseUrl()+"#/t/"+code;
+  var qs=Object.keys(tags||{}).filter(function(k){return tags[k];})
+    .map(function(k){ return "dq_"+encodeURIComponent(k)+"="+encodeURIComponent(tags[k]); });
+  return qs.length ? u+"?"+qs.join("&") : u;
+}
 
 async function boot(){
   await initStorage();
-  S.guestCode=readHash();
+  var hashInfo=readHash();
+  S.guestCode = hashInfo ? hashInfo.code : null;
   var pass=await sg("passcode");
   var myrole=await sg("myrole",false);
   var idx=await sg("index")||[];
@@ -485,7 +507,7 @@ async function boot(){
   if(S.guestCode){
     S.role="guest"; S.index=idx; S.activeId=act;
     var hit=idx.filter(function(x){ return (x.code||"").toUpperCase()===S.guestCode; })[0];
-    if(hit){ await enterRun(hit.id,false); S.guestMissing=false; }
+    if(hit){ await enterRun(hit.id,false,hashInfo.tags); S.guestMissing=false; }
     else { S.guestMissing=true; }
     S.ready=true; R(); return;
   }
@@ -546,15 +568,23 @@ function openModal(cfg){ S.modal=cfg; R(); }
 function closeModal(){ S.modal=null; R(); }
 function modalEl(){
   var m=S.modal; if(!m) return null;
-  var body=[ e("h3",{},[m.title]), m.body?e("p",{},[m.body]):null ];
+  var body=[];
+  if(m.icon) body.push(e("div",{style:"font-size:34px;line-height:1;margin-bottom:10px"},[m.icon]));
+  body.push(e("h3",{},[m.title]));
+  if(m.body) body.push(e("p",{},[m.body]));
   if(m.custom) body.push(m.custom());
-  body.push(e("div",{class:"row",style:"justify-content:flex-end;margin-top:6px"},[
-    e("button",{class:"b sec sm",onclick:function(){ closeModal(); m.onCancel&&m.onCancel(); }},[m.cancelText||"取消"]),
-    e("button",{class:"b sm "+(m.danger?"dgrf":"pri"),onclick:function(){ m.onConfirm&&m.onConfirm(); }},[m.confirmText||"確認"])
-  ]));
+  var acts=[];
+  if(!m.single) acts.push(e("button",{class:"b sec sm",onclick:function(){ closeModal(); m.onCancel&&m.onCancel(); }},[m.cancelText||"取消"]));
+  acts.push(e("button",{class:"b sm "+(m.danger?"dgrf":"pri"),onclick:function(){
+    if(m.onConfirm) m.onConfirm(); else closeModal();
+  }},[m.confirmText||"確認"]));
+  body.push(e("div",{class:"row",style:"justify-content:flex-end;margin-top:6px"},acts));
   return e("div",{class:"ovl",onclick:function(ev){ if(ev.target.classList.contains("ovl")){ closeModal(); m.onCancel&&m.onCancel(); } }},[
     e("div",{class:"mdl"},body)
   ]);
+}
+function toast(title,body){
+  openModal({ icon:"✓", title:title, body:body||null, single:true, confirmText:"知道了", onConfirm:closeModal });
 }
 
 /* ============ render ============ */
@@ -764,8 +794,8 @@ function adminPrompt(){
 }
 
 /* ============ HOME ============ */
-function copyLink(code){
-  var url=shareUrl(code);
+function copyLink(code,tags,label){
+  var url=shareUrl(code,tags);
   function done(okMsg){
     openModal({title:"測試連結",body:okMsg,confirmText:"知道了",cancelText:"關閉",
       custom:function(){
@@ -773,9 +803,10 @@ function copyLink(code){
       },
       onConfirm:closeModal});
   }
+  var msg = "已複製到剪貼簿。"+(label?("這是「"+label+"」版本的連結，"):"")+"把這個連結給受測者，他們會直接進入測試，看不到管理介面。";
   try{
     if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(url).then(function(){ done("已複製到剪貼簿。把這個連結給受測者，他們會直接進入測試，看不到管理介面。"); },
+      navigator.clipboard.writeText(url).then(function(){ done(msg); },
         function(){ done("無法自動複製，請手動選取下方網址。"); });
       return;
     }
@@ -841,7 +872,15 @@ function vEdit(w){
     e("div",{class:"sp"}),
     S.msg?e("span",{class:"tiny"},[S.msg]):null,
     e("button",{class:"b pri sm",onclick:async function(){
-      await saveTest(t); S.msg="已儲存 "+new Date().toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"}); R();
+      try{
+        await saveTest(t);
+        S.msg="";
+        toast("已儲存", t.name+"　"+new Date().toLocaleTimeString("zh-TW",{hour:"2-digit",minute:"2-digit"})
+          + (STORE.tier==="cloud" ? "\n設定已同步到雲端，受測者開啟連結時會看到最新版本。" : ""));
+      }catch(ex){
+        openModal({title:"儲存失敗",danger:true,single:true,confirmText:"知道了",
+          body:(ex&&ex.message||ex)+"\n\n變更仍保留在畫面上，請稍後再試一次。",onConfirm:closeModal});
+      }
     }},["儲存"])
   ]));
   var st=e("div",{class:"steps"});
@@ -996,31 +1035,10 @@ function askDelete(t,id){
   }});
 }
 
-function stepTasks(w,t){
-  w.appendChild(e("h2",{},["任務設定"]));
-  w.appendChild(e("p",{class:"sub"},["每個任務給受測者一個情境，並指定一個或多個正確節點。"]));
-  if(!t.tasks.length) w.appendChild(e("div",{class:"empty"},["還沒有任務。"]));
-  t.tasks.forEach(function(k,i){
-    var chips=e("div",{});
-    k.correct.forEach(function(cid){
-      var p=pathTo(t.tree,cid);
-      chips.appendChild(e("span",{class:"ans"},["✓ "+(p.length?p.join(" › "):"（節點已刪除）")]));
-    });
-    if(!k.correct.length) chips.appendChild(e("span",{class:"ans",style:"background:var(--neg-l);color:var(--neg)"},["未設定正確答案"]));
-    w.appendChild(e("div",{class:"tk"},[ e("div",{class:"tkh"},[
-      e("div",{class:"tkn"},[String(i+1)]),
-      e("div",{class:"tkt"},[k.text,k.note?e("div",{class:"tiny",style:"margin-top:3px"},["測試目的："+k.note]):null,chips]),
-      e("div",{class:"row"},[
-        e("button",{class:"b min sm",onclick:function(){ S.editingId=k.id; S.draft={text:k.text,correct:k.correct.slice(),note:k.note||""}; R(); }},["編輯"]),
-        e("button",{class:"b dgr sm",onclick:function(){
-          openModal({title:"刪除任務",body:k.text,confirmText:"刪除",danger:true,onConfirm:function(){
-            t.tasks=t.tasks.filter(function(x){return x.id!==k.id;}); closeModal(); }});
-        }},["刪除"])
-      ])
-    ])]));
-  });
-  var f=e("div",{class:"card flat"});
-  f.appendChild(e("span",{class:"lbl"},[S.editingId?"編輯任務":"新增任務"]));
+function taskForm(t,mode){
+  // mode: "edit" (inline, under the task) or "add" (at the end of the list)
+  var f=e("div",{class:"card flat",style:mode==="edit"?"margin:-4px 0 14px;border-left:3px solid var(--blue)":""});
+  f.appendChild(e("span",{class:"lbl"},[mode==="edit"?"編輯這個任務":"新增任務"]));
   var ti=e("input",{class:"in",placeholder:"任務情境（呈現給受測者的文字）"});
   ti.value=S.draft.text; ti.addEventListener("input",function(ev){S.draft.text=ev.target.value;});
   f.appendChild(ti); f.appendChild(e("div",{style:"height:10px"}));
@@ -1049,10 +1067,49 @@ function stepTasks(w,t){
         k.text=S.draft.text.trim(); k.correct=S.draft.correct.slice(); k.note=S.draft.note.trim();
       } else t.tasks.push({id:uid(),text:S.draft.text.trim(),correct:S.draft.correct.slice(),note:S.draft.note.trim()});
       S.editingId=null; S.draft={text:"",correct:[],note:""}; R();
-    }},[S.editingId?"儲存修改":"加入任務"]),
-    S.editingId?e("button",{class:"b min sm",onclick:function(){ S.editingId=null; S.draft={text:"",correct:[],note:""}; S.draftErr=""; R(); }},["取消"]):null
+    }},[mode==="edit"?"儲存修改":"加入任務"]),
+    mode==="edit"?e("button",{class:"b min sm",onclick:function(){
+      S.editingId=null; S.draft={text:"",correct:[],note:""}; S.draftErr=""; R();
+    }},["取消"]):null
   ]));
-  w.appendChild(f);
+  return f;
+}
+
+function stepTasks(w,t){
+  w.appendChild(e("h2",{},["任務設定"]));
+  w.appendChild(e("p",{class:"sub"},["每個任務給受測者一個情境，並指定一個或多個正確節點。"]));
+  if(!t.tasks.length) w.appendChild(e("div",{class:"empty"},["還沒有任務。"]));
+  t.tasks.forEach(function(k,i){
+    var editing = S.editingId===k.id;
+    var chips=e("div",{});
+    k.correct.forEach(function(cid){
+      var p=pathTo(t.tree,cid);
+      chips.appendChild(e("span",{class:"ans"},["✓ "+(p.length?p.join(" › "):"（節點已刪除）")]));
+    });
+    if(!k.correct.length) chips.appendChild(e("span",{class:"ans",style:"background:var(--neg-l);color:var(--neg)"},["未設定正確答案"]));
+    w.appendChild(e("div",{class:"tk","data-tid":k.id,
+      style:editing?"border-color:var(--blue);background:var(--blue-l)":""},[ e("div",{class:"tkh"},[
+      e("div",{class:"tkn",style:editing?"background:var(--blue)":""},[String(i+1)]),
+      e("div",{class:"tkt"},[k.text,k.note?e("div",{class:"tiny",style:"margin-top:3px"},["測試目的："+k.note]):null,chips]),
+      e("div",{class:"row"},[
+        e("button",{class:"b "+(editing?"pri":"min")+" sm",onclick:function(){
+          if(editing){ S.editingId=null; S.draft={text:"",correct:[],note:""}; S.draftErr=""; R(); return; }
+          S.editingId=k.id; S.draft={text:k.text,correct:k.correct.slice(),note:k.note||""}; S.draftErr=""; R();
+        }},[editing?"收合":"編輯"]),
+        e("button",{class:"b dgr sm",onclick:function(){
+          openModal({title:"刪除任務",body:k.text,confirmText:"刪除",danger:true,onConfirm:function(){
+            t.tasks=t.tasks.filter(function(x){return x.id!==k.id;});
+            if(S.editingId===k.id){ S.editingId=null; S.draft={text:"",correct:[],note:""}; }
+            closeModal(); }});
+        }},["刪除"])
+      ])
+    ])]));
+    // Editor opens directly beneath the task it belongs to.
+    if(editing) w.appendChild(taskForm(t,"edit"));
+  });
+
+  if(!S.editingId) w.appendChild(taskForm(t,"add"));
+
   w.appendChild(e("div",{class:"row",style:"margin-top:20px"},[
     e("button",{class:"b sec",onclick:function(){S.step=1;R();}},["← 上一步"]),
     e("div",{class:"sp"}),
@@ -1060,53 +1117,11 @@ function stepTasks(w,t){
   ]));
 }
 
-function stepDemo(w,t){
-  t.demographics=t.demographics||[];
-  w.appendChild(e("h2",{},["受測者資料"]));
-  w.appendChild(e("p",{class:"sub"},["測試開始前詢問的分類問題。建議只收會影響資料解讀的變項——招募說明already承諾不記錄個人資料，收姓名、性別、年齡這類欄位會與該承諾衝突，且在本輪沒有分析用途。"]));
-
-  if(!t.demographics.length) w.appendChild(e("div",{class:"empty"},["沒有設定任何問題，受測者將只需填寫編號。"]));
-
-  t.demographics.forEach(function(q,i){
-    var box=e("div",{class:"dq"+(q.byModerator?" mod":"")});
-    box.appendChild(e("div",{class:"row",style:"align-items:flex-start"},[
-      e("div",{style:"flex:1"},[
-        e("div",{style:"font-size:14px;font-weight:600"},[
-          q.label,
-          q.required?e("span",{style:"color:var(--neg);margin-left:4px"},["*"]):null,
-          q.byModerator?e("span",{class:"modtag"},["主持人填寫"]):null
-        ]),
-        q.note?e("div",{class:"tiny",style:"margin-top:4px"},[q.note]):null,
-        e("div",{class:"chips",style:"margin-top:8px"},q.options.map(function(o){
-          return e("span",{class:"chip"},[o]);
-        }))
-      ]),
-      e("div",{class:"row"},[
-        e("button",{class:"b min sm",disabled:i===0,onclick:function(){
-          var tmp=t.demographics[i-1]; t.demographics[i-1]=t.demographics[i]; t.demographics[i]=tmp; R();
-        }},["↑"]),
-        e("button",{class:"b min sm",disabled:i===t.demographics.length-1,onclick:function(){
-          var tmp=t.demographics[i+1]; t.demographics[i+1]=t.demographics[i]; t.demographics[i]=tmp; R();
-        }},["↓"]),
-        e("button",{class:"b min sm",onclick:function(){
-          S.dqEditing=q.id;
-          S.dqDraft={label:q.label,options:q.options.join("\n"),note:q.note||"",required:!!q.required,byModerator:!!q.byModerator};
-          R();
-        }},["編輯"]),
-        e("button",{class:"b dgr sm",onclick:function(){
-          openModal({title:"刪除問題",body:q.label,confirmText:"刪除",danger:true,onConfirm:function(){
-            t.demographics=t.demographics.filter(function(x){return x.id!==q.id;}); closeModal();
-          }});
-        }},["刪除"])
-      ])
-    ]));
-    w.appendChild(box);
-  });
-
+function demoForm(t,mode){
   if(!S.dqDraft) S.dqDraft={label:"",options:"",note:"",required:true,byModerator:false};
   var d=S.dqDraft;
-  var f=e("div",{class:"card flat"});
-  f.appendChild(e("span",{class:"lbl"},[S.dqEditing?"編輯問題":"新增問題"]));
+  var f=e("div",{class:"card flat",style:mode==="edit"?"margin:-4px 0 14px;border-left:3px solid var(--blue)":""});
+  f.appendChild(e("span",{class:"lbl"},[mode==="edit"?"編輯這個問題":"新增問題"]));
   var li=e("input",{class:"in",placeholder:"問題文字，例如：您所屬的單位類型"});
   li.value=d.label; li.addEventListener("input",function(ev){d.label=ev.target.value;});
   f.appendChild(li);
@@ -1126,7 +1141,7 @@ function stepDemo(w,t){
   c2.checked=d.byModerator; c2.addEventListener("change",function(ev){d.byModerator=ev.target.checked;});
   f.appendChild(e("div",{class:"row",style:"gap:20px"},[
     e("label",{style:"display:flex;gap:7px;align-items:center;font-size:13.5px;cursor:pointer"},[c1,"必填"]),
-    e("label",{style:"display:flex;gap:7px;align-items:center;font-size:13.5px;cursor:pointer"},[c2,"由主持人填寫"])
+    e("label",{style:"display:flex;gap:7px;align-items:center;font-size:13.5px;cursor:pointer"},[c2,"透過分批連結指定（而非讓受測者自己選）"])
   ]));
   if(S.draftErr) f.appendChild(e("div",{class:"err"},[S.draftErr]));
   f.appendChild(e("div",{class:"row",style:"margin-top:12px"},[
@@ -1143,10 +1158,67 @@ function stepDemo(w,t){
           required:d.required,byModerator:d.byModerator});
       }
       S.dqEditing=null; S.dqDraft=null; R();
-    }},[S.dqEditing?"儲存修改":"加入問題"]),
-    S.dqEditing?e("button",{class:"b min sm",onclick:function(){ S.dqEditing=null; S.dqDraft=null; S.draftErr=""; R(); }},["取消"]):null
+    }},[mode==="edit"?"儲存修改":"加入問題"]),
+    mode==="edit"?e("button",{class:"b min sm",onclick:function(){ S.dqEditing=null; S.dqDraft=null; S.draftErr=""; R(); }},["取消"]):null
   ]));
-  w.appendChild(f);
+  return f;
+}
+
+function stepDemo(w,t){
+  t.demographics=t.demographics||[];
+  w.appendChild(e("h2",{},["受測者資料"]));
+  w.appendChild(e("p",{class:"sub"},["測試開始前詢問的分類問題。建議只收會影響資料解讀的變項——招募說明已承諾不記錄個人資料，收姓名、性別、年齡這類欄位會與該承諾衝突，且在本輪沒有分析用途。"]));
+
+  if(!t.demographics.length) w.appendChild(e("div",{class:"empty"},["沒有設定任何問題，受測者將只需填寫編號。"]));
+
+  var hasModq=t.demographics.some(function(q){return q.byModerator;});
+  if(hasModq) w.appendChild(e("div",{class:"note"},[
+    "標示「透過連結指定」的問題，答案不會拿去問受測者，而是綁在你分享出去的連結上——設定完成後，到最後一步「基本資訊」可以為每個答案產生對應的專屬連結。沒有標記的連結會退回當面詢問。"
+  ]));
+
+  t.demographics.forEach(function(q,i){
+    var editing=S.dqEditing===q.id;
+    var box=e("div",{class:"dq"+(q.byModerator?" mod":""),
+      style:editing?"border-color:var(--blue);background:var(--blue-l)":""});
+    box.appendChild(e("div",{class:"row",style:"align-items:flex-start"},[
+      e("div",{style:"flex:1"},[
+        e("div",{style:"font-size:14px;font-weight:600"},[
+          q.label,
+          q.required?e("span",{style:"color:var(--neg);margin-left:4px"},["*"]):null,
+          q.byModerator?e("span",{class:"modtag"},["透過連結指定"]):null
+        ]),
+        q.note?e("div",{class:"tiny",style:"margin-top:4px"},[q.note]):null,
+        e("div",{class:"chips",style:"margin-top:8px"},q.options.map(function(o){
+          return e("span",{class:"chip"},[o]);
+        }))
+      ]),
+      e("div",{class:"row"},[
+        e("button",{class:"b min sm",disabled:i===0,onclick:function(){
+          var tmp=t.demographics[i-1]; t.demographics[i-1]=t.demographics[i]; t.demographics[i]=tmp; R();
+        }},["↑"]),
+        e("button",{class:"b min sm",disabled:i===t.demographics.length-1,onclick:function(){
+          var tmp=t.demographics[i+1]; t.demographics[i+1]=t.demographics[i]; t.demographics[i]=tmp; R();
+        }},["↓"]),
+        e("button",{class:"b "+(editing?"pri":"min")+" sm",onclick:function(){
+          if(editing){ S.dqEditing=null; S.dqDraft=null; S.draftErr=""; R(); return; }
+          S.dqEditing=q.id;
+          S.dqDraft={label:q.label,options:q.options.join("\n"),note:q.note||"",required:!!q.required,byModerator:!!q.byModerator};
+          S.draftErr=""; R();
+        }},[editing?"收合":"編輯"]),
+        e("button",{class:"b dgr sm",onclick:function(){
+          openModal({title:"刪除問題",body:q.label,confirmText:"刪除",danger:true,onConfirm:function(){
+            t.demographics=t.demographics.filter(function(x){return x.id!==q.id;});
+            if(S.dqEditing===q.id){ S.dqEditing=null; S.dqDraft=null; }
+            closeModal();
+          }});
+        }},["刪除"])
+      ])
+    ]));
+    w.appendChild(box);
+    if(editing) w.appendChild(demoForm(t,"edit"));
+  });
+
+  if(!S.dqEditing) w.appendChild(demoForm(t,"add"));
 
   w.appendChild(e("div",{class:"row",style:"margin-top:20px"},[
     e("button",{class:"b sec",onclick:function(){S.step=2;R();}},["← 上一步"]),
@@ -1194,12 +1266,22 @@ function stepMeta(w,t){
   w.appendChild(e("div",{class:"row"},[
     e("button",{class:"b sec",onclick:function(){S.step=3;R();}},["← 上一步"]),
     e("div",{class:"sp"}),
-    e("button",{class:"b pri",onclick:async function(){ await saveTest(t); S.view="home"; R(); }},["儲存並返回列表"])
+    e("button",{class:"b pri",onclick:async function(){
+      try{
+        await saveTest(t);
+        openModal({ icon:"✓", title:"已儲存", single:true, confirmText:"返回列表",
+          body:t.name+" 的設定已更新。"+(STORE.tier==="cloud"?"\n受測者開啟連結時會看到最新版本。":""),
+          onConfirm:function(){ S.modal=null; S.view="home"; R(); } });
+      }catch(ex){
+        openModal({title:"儲存失敗",danger:true,single:true,confirmText:"知道了",
+          body:(ex&&ex.message||ex)+"\n\n變更仍保留在畫面上，請稍後再試一次。",onConfirm:closeModal});
+      }
+    }},["儲存並返回列表"])
   ]));
 }
 
 /* ============ RUN ============ */
-async function enterRun(id,preview){
+async function enterRun(id,preview,linkTags){
   stopCd();
   var t=id?await sg("t:"+id):null, n=1;
   if(t){
@@ -1207,9 +1289,18 @@ async function enterRun(id,preview){
     for(var i=0;i<ks.length;i++){ var v=await sg(ks[i]); if(v&&v.pid) pids[v.pid]=1; }
     n=Object.keys(pids).length+1;
   }
+  // linkTags: pre-answered demographic values carried by the URL itself (see readHash).
+  // Only values matching a real question id on this test are trusted.
+  var demo={}, tagged={};
+  if(linkTags && t && t.demographics){
+    var ids={}; t.demographics.forEach(function(q){ ids[q.id]=q; });
+    Object.keys(linkTags).forEach(function(qid){
+      if(ids[qid] && ids[qid].options.indexOf(linkTags[qid])>=0){ demo[qid]=linkTags[qid]; tagged[qid]=true; }
+    });
+  }
   S.run={ phase:"intro", testId:id, test:t, cd:5, pid:(preview?"預覽":"P"+String(n).padStart(2,"0")),
           order:[], idx:0, open:{}, sel:null, opened:[], t0:0, timer:null,
-          preview:!!preview, demo:{}, demoErr:"" };
+          preview:!!preview, demo:demo, tagged:tagged, demoErr:"" };
   S.view="run";
 }
 function stopCd(){ if(S.run&&S.run.timer){ clearInterval(S.run.timer); S.run.timer=null; } }
@@ -1251,8 +1342,15 @@ function vRun(w){
 
   if(r.phase==="id"){
     var qs=(t.demographics||[]);
-    var mine=qs.filter(function(q){return !q.byModerator;});
-    var modq=qs.filter(function(q){return q.byModerator;});
+    // Pre-tagged by the link (batch links, see settings) — never shown as a question.
+    var tagged=qs.filter(function(q){return r.tagged&&r.tagged[q.id];});
+    // "By moderator" questions that this particular link did NOT pre-answer —
+    // this only happens with the plain (untagged) link, so fall back to asking
+    // right here, in person, exactly like before.
+    var toAsk=qs.filter(function(q){return !(r.tagged&&r.tagged[q.id]);});
+    var mine=toAsk.filter(function(q){return !q.byModerator;});
+    var modq=toAsk.filter(function(q){return q.byModerator;});
+
     w.appendChild(e("h1",{},["開始之前"]));
     w.appendChild(e("p",{class:"sub"},[ mine.length
       ? "請確認編號並回答幾個分類問題。這些答案只用於分組解讀結果，不會用來識別您個人。"
@@ -1265,10 +1363,19 @@ function vRun(w){
     c.appendChild(e("div",{class:"tiny",style:"margin-top:8px"},["測試代號："+(t.code||"—")]));
     w.appendChild(c);
 
+    if(tagged.length){
+      w.appendChild(e("div",{class:"note"},
+        tagged.map(function(q){ return q.label+"："+r.demo[q.id]; }).reduce(function(acc,line,i){
+          if(i>0) acc.push(e("br",{}));
+          acc.push(line); return acc;
+        },[])
+      ));
+    }
+
     mine.forEach(function(q){ w.appendChild(demoBlock(q,false)); });
     if(modq.length){
       w.appendChild(e("div",{class:"pvbar",style:"border-radius:var(--r);border:1px solid #F0D9A8;margin-bottom:12px"},[
-        e("span",{},["以下由主持人填寫"])
+        e("span",{},["以下由主持人填寫（此連結未預先標記，需在旁協助作答時當場選擇）"])
       ]));
       modq.forEach(function(q){ w.appendChild(demoBlock(q,true)); });
     }
